@@ -16,3 +16,4 @@ configs/local/
 artifacts/
 build/
 dist/
+.vscode/

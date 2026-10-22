@@ -116,12 +116,37 @@ def publish(output, manifest, tasks, active=None):
         atomic_json(output / f"{method}.summary.json", summaries[method])
         atomic_json(output / f"{method}.reliability.json", reliability[method])
     complete = all(s["complete"] for s in summaries.values())
+    # 按 method 汇总各阶段用时与重试统计
+    method_timings = {}
+    for ident, task in tasks.items():
+        method_name = ident.split(":")[0]
+        timing = method_timings.setdefault(method_name, {
+            "total_seconds": 0.0,
+            "phase_seconds": {},
+            "retry_stats": {"count_429": 0, "count_503": 0, "retry_count": 0, "retry_seconds": 0.0},
+            "completed_jobs": 0, "failed_jobs": 0,
+        })
+        if "phase_seconds" in task:
+            for phase, secs in task["phase_seconds"].items():
+                timing["phase_seconds"][phase] = timing["phase_seconds"].get(phase, 0) + secs
+        if "retry_stats" in task:
+            for key in ("count_429", "count_503", "retry_count", "retry_seconds"):
+                timing["retry_stats"][key] += task["retry_stats"].get(key, 0)
+        if task.get("status") == "complete":
+            timing["completed_jobs"] += 1
+        elif task.get("status") == "failed":
+            timing["failed_jobs"] += 1
+    # total_seconds 用各阶段秒数之和（不含 memory 的 wall-clock 差异，足够近似）
+    for timing in method_timings.values():
+        timing["total_seconds"] = round(sum(timing["phase_seconds"].values()), 3)
+        timing["retry_stats"]["retry_seconds"] = round(timing["retry_stats"]["retry_seconds"], 3)
     state = {"status": "complete" if complete else "running" if active else "incomplete",
         "pid": os.getpid(), "active": active, "completed_jobs": sum(t["status"] == "complete" for t in tasks.values()),
         "failed_jobs": sum(t["status"] == "failed" for t in tasks.values()), "tasks": tasks,
-        "summaries": summaries, "updated_unix_seconds": time.time(), "official_aml_comparable": False}
+        "summaries": summaries, "method_timings": method_timings,
+        "updated_unix_seconds": time.time(), "official_aml_comparable": False}
     atomic_json(output / "progress.json", state)
-    atomic_json(output / "report.json", {key: state[key] for key in ("status", "summaries", "completed_jobs", "failed_jobs", "active")})
+    atomic_json(output / "report.json", {key: state[key] for key in ("status", "summaries", "completed_jobs", "failed_jobs", "active", "method_timings")})
     return state
 
 
@@ -132,6 +157,9 @@ def execute_task(prepared, output, manifest, method, case, retry_failed=False):
     queries = [Query(**q) for q in rows(prepared / case["queries"])]
     expected = {q.qa_id for q in queries}
     client = None
+    phase_seconds = {}
+    retry_stats = {"count_429": 0, "count_503": 0, "retry_count": 0, "retry_seconds": 0.0}
+    task_started = time.monotonic()
     try:
         checkpoints = read_json(folder / "checkpoint.json") if (folder / "checkpoint.json").exists() else {}
         for relative, digest in checkpoints.get("files", {}).items():
@@ -151,14 +179,20 @@ def execute_task(prepared, output, manifest, method, case, retry_failed=False):
                 "output": str(stage)}
             write_json(stage / "job.json", job)
             env = {**os.environ, "PYTHONPATH": str(output / "frozen_framework/src"), "PYTHONDONTWRITEBYTECODE": "1"}
+            memory_started = time.monotonic()
             with (stage / "worker.log").open("w") as log:
                 process = subprocess.run([manifest["methods"][method]["config"]["python"],
                     "-m", "memory_benchmark.runtime.worker", str(stage / "job.json")], env=env,
                     stdout=log, stderr=subprocess.STDOUT, timeout=runtime["worker_timeout_seconds"])
+            phase_seconds["memory"] = time.monotonic() - memory_started
             worker = read_json(stage / "report.json") if (stage / "report.json").exists() else {}
             if process.returncode or worker.get("status") != "complete":
                 return {"status": "failed", "phase": "memory", "error_type": worker.get("error_type", "WorkerProcessExit"),
-                        "returncode": process.returncode, "worker_report": str(stage / "report.json")}
+                        "returncode": process.returncode, "worker_report": str(stage / "report.json"),
+                        "phase_seconds": phase_seconds, "retry_stats": retry_stats}
+            # 从 worker report 提取各阶段秒数（init/add/finalize/search/close）
+            for phase, secs in worker.get("phase_seconds", {}).items():
+                phase_seconds[phase] = phase_seconds.get(phase, 0) + secs
             retrievals = records(stage / "retrievals.jsonl")
             if len(retrievals) != len(expected) or {r["id"] for r in retrievals} != expected:
                 raise ValueError("Retrieval question set differs from frozen set")
@@ -181,6 +215,7 @@ def execute_task(prepared, output, manifest, method, case, retry_failed=False):
         for query in queries:
             if query.qa_id not in completed_answers:
                 value = answer(query, retrievals[query.qa_id], history.speakers, client, tokenizer, runtime)
+                phase_seconds["answer"] = phase_seconds.get("answer", 0) + value.get("seconds", 0)
                 append_row(folder / "answers.jsonl", value)
                 completed_answers[query.qa_id] = value
                 checkpoints["files"]["answers.jsonl"] = file_hash(folder / "answers.jsonl")
@@ -190,16 +225,29 @@ def execute_task(prepared, output, manifest, method, case, retry_failed=False):
         for query in queries:
             if query.qa_id not in native_scores:
                 value = evaluate(query, targets[query.qa_id], completed_answers[query.qa_id], client, runtime)
+                phase_seconds["judge"] = phase_seconds.get("judge", 0) + value.get("seconds", 0)
                 import_native(manifest, [value], case["benchmark"], method, output.name)
                 append_row(folder / "native_scores.jsonl", value)
                 checkpoints["files"]["native_scores.jsonl"] = file_hash(folder / "native_scores.jsonl")
                 atomic_json(folder / "checkpoint.json", checkpoints)
-        return {"status": "complete", "questions": len(queries), "folder": str(folder)}
+        return {"status": "complete", "questions": len(queries), "folder": str(folder),
+                "phase_seconds": phase_seconds, "retry_stats": retry_stats}
     except Exception as error:
         return {"status": "failed", "error_type": type(error).__name__,
                 "stack": [{"file": f.filename, "line": f.lineno, "function": f.name}
-                          for f in traceback.extract_tb(error.__traceback__)]}
+                          for f in traceback.extract_tb(error.__traceback__)],
+                "phase_seconds": phase_seconds, "retry_stats": retry_stats}
     finally:
+        # 从 reader/evaluate 阶段的 budget rows 提取重试统计
+        if client and client.budget:
+            for row in client.budget.rows:
+                if row.get("http_status") == 429:
+                    retry_stats["count_429"] += 1
+                if row.get("http_status") == 503:
+                    retry_stats["count_503"] += 1
+                if row.get("retry_count", 0) > 0:
+                    retry_stats["retry_count"] += 1
+                    retry_stats["retry_seconds"] += row.get("seconds", 0)
         if client:
             client.close()
 

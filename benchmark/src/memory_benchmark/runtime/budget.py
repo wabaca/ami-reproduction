@@ -19,6 +19,7 @@ class CallBudget:
         self.failed = None
         self.on_change = on_change
         self.peak_reserved = 0.0
+        self.allow_retries = profile.get('AMI_ALLOW_RETRIES', '0') == '1'
         self.rates = {}
         for kind, names in {
             'llm': ('AMI_TEST_INPUT_CNY_PER_MILLION', 'AMI_TEST_OUTPUT_CNY_PER_MILLION'),
@@ -63,13 +64,16 @@ def make_transport(budget, kind, endpoint, model, *,
             self.client.close()
 
         def handle_request(self, request):
+            import httpx as _httpx
+            # HTTP 状态码视为可重试的集合：429 限流、5xx 服务端临时错误。
+            RETRYABLE_STATUS = {429, 500, 502, 503, 504}
             with budget.lock:
                 budget.check()
                 payload = json.loads(request.content)
                 if request.method != 'POST' or str(request.url) != endpoint or payload.get('model') != model:
                     budget.failed = 'Unexpected provider endpoint or model'
                     budget.check()
-                if request.headers.get('x-stainless-retry-count', '0') != '0':
+                if request.headers.get('x-stainless-retry-count', '0') != '0' and not budget.allow_retries:
                     budget.failed = 'Retry forbidden'
                     budget.check()
                 if kind in {'llm', 'judge'}:
@@ -91,17 +95,28 @@ def make_transport(budget, kind, endpoint, model, *,
                 reservation = budget.cost(kind, input_bound, output_bound)
                 budget.reserved += reservation
                 budget.peak_reserved = max(budget.peak_reserved, budget.reserved)
+                retry_count = int(request.headers.get('x-stainless-retry-count', '0'))
                 row = {'kind': kind, 'input_token_bound': input_bound,
                        'output_token_bound': output_bound, 'reserved_cny': reservation,
                        'requested_model': payload['model'],
-                       'phase': getattr(budget, 'phase', 'unspecified'), 'started_unix_seconds': time.time()}
+                       'phase': getattr(budget, 'phase', 'unspecified'), 'started_unix_seconds': time.time(),
+                       'retry_count': retry_count}
                 request_started = time.perf_counter()
                 budget.rows.append(row)
                 budget.notify()
                 response = None
                 try:
-                    response = self.client.send(request, stream=False, follow_redirects=False)
-                    response.read()
+                    try:
+                        response = self.client.send(request, stream=False, follow_redirects=False)
+                        response.read()
+                    except _httpx.TransportError as transport_error:
+                        # 网络层错误（连接超时、DNS、连接重置等）：不熔断 budget，
+                        # 让 SDK 的 max_retries 机制真正重传。重试时 budget.check() 仍通过。
+                        row['error_type'] = type(transport_error).__name__
+                        row['seconds'] = time.perf_counter() - request_started
+                        budget.reserved += row.get('estimated_cny', 0) - reservation
+                        budget.notify()
+                        raise
                     row['http_status'] = response.status_code
                     if response.status_code != 200:
                         try:
@@ -116,6 +131,13 @@ def make_transport(budget, kind, endpoint, model, *,
                             'RequestPath.NotFound', 'invalid_parameter', 'InvalidParameter'}
                         if isinstance(code, str) and code in safe_codes:
                             row['provider_error_code'] = code
+                        if response.status_code in RETRYABLE_STATUS:
+                            # 429/5xx：可重试，不熔断 budget，让 SDK 重传。
+                            row['retryable'] = True
+                            budget.reserved += row.get('estimated_cny', 0) - reservation
+                            budget.notify()
+                            raise RuntimeError(f'Provider returned retryable status {response.status_code}')
+                        # 4xx 业务错误：致命，熔断。
                         budget.failed = f"{kind} HTTP {response.status_code}" + (
                             f" ({code})" if row.get('provider_error_code') else '')
                         raise RuntimeError('Provider returned non-200 status')
@@ -155,17 +177,24 @@ def make_transport(budget, kind, endpoint, model, *,
                     if kind in {'llm', 'judge'} and not body['choices'][0]['message']['content'].strip():
                         raise ValueError('Empty completion')
                 except Exception as error:
+                    # 仅在 budget.failed 已被置位（致命错误）时熔断；
+                    # 可重试错误（网络错误、429/5xx）不置位，让 SDK 重传。
                     row['error_type'] = type(error).__name__
-                    row['seconds'] = time.perf_counter() - request_started
+                    if 'seconds' not in row:
+                        row['seconds'] = time.perf_counter() - request_started
                     if response is not None:
                         response.close()
                     if budget.failed is None:
-                        budget.failed = 'Provider failure; no further requests allowed'
-                    budget.check()
+                        # 如果是可重试错误（row 标记了 retryable），不熔断。
+                        if not row.get('retryable') and not isinstance(error, _httpx.TransportError):
+                            budget.failed = 'Provider failure; no further requests allowed'
+                    if budget.failed is not None:
+                        budget.check()
                 # Keep actual completed costs, plus any in-flight reservation,
                 # rather than charging every conservative estimate forever.
-                budget.reserved += row['estimated_cny'] - reservation
-                row['seconds'] = time.perf_counter() - request_started
+                budget.reserved += row.get('estimated_cny', 0) - reservation
+                if 'seconds' not in row:
+                    row['seconds'] = time.perf_counter() - request_started
                 budget.notify()
                 return response
 

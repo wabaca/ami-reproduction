@@ -145,7 +145,7 @@ PY
 ```bash
 .venv/bin/python scripts/prepare_five_seeds.py \
   --suite configs/local/suite.json --runtime configs/local/runtime.json \
-  --output runs/prepared-five-seeds-new
+  --output runs/prepared-five-seeds
 ```
 
 此步骤离线校验来源，恢复完整历史和评分目标，冻结同一批题目并核验逐轮数量；输出五个 `seed-*` prepared 及 `summary.json`，不调用 API。
@@ -178,7 +178,7 @@ adapter 检查禁止联网，以替身验证原生 API、system 消息、时间�
 ```bash
 # AMI；Mem0 改为 methods.mem0.json 和独立输出目录。
 .venv/bin/python -m memory_benchmark.runtime.queue \
-  --prepared runs/prepared-five-seeds-new/seed-17 \
+  --prepared runs/prepared-five-seeds/seed-17 \
   --methods-config configs/local/methods.activememoryindex.json \
   --output runs/ami-new/seed-17
 
